@@ -11,8 +11,41 @@
  * Learn more at https://developers.cloudflare.com/workers/
  */
 
+import puppeteer, { Browser, PDFOptions } from '@cloudflare/puppeteer';
+
+interface Env {
+	MYBROWSER: Fetcher;
+}
+
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
-		return new Response('Hello World!');
+		const body = await request.text();
+		const jsonBody = body ? JSON.parse(body) : {};
+		const html = jsonBody.html;
+		const options: PDFOptions = {
+			format: jsonBody.format || 'A4',
+			printBackground: jsonBody.printBackground !== undefined ? jsonBody.printBackground : true,
+		};
+
+		const browser = await puppeteer.launch(env.MYBROWSER);
+		const pdf = await generatePDF(browser, html, options);
+		browser.close();
+
+		return new Response(pdf, {
+			headers: {
+				'Content-Type': 'application/pdf',
+			},
+		});
 	},
 } satisfies ExportedHandler<Env>;
+
+async function generatePDF(browser: Browser, html: string, options?: PDFOptions): Promise<Buffer> {
+	const { format = 'A4', printBackground = true } = options || {};
+
+	const page = await browser.newPage();
+	await page.setContent(html);
+	const pdfBuffer = await page.pdf(options);
+	await page.close();
+
+	return pdfBuffer;
+}
