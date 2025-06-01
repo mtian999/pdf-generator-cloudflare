@@ -3,6 +3,7 @@ import { z, ZodError } from "zod";
 
 interface Env {
   MYBROWSER: Fetcher;
+  API_KEY: string;
 }
 
 const requestSchema = z.object({
@@ -27,6 +28,22 @@ export default {
       });
     }
 
+    const authHeader = request.headers.get("Authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return new Response(JSON.stringify({ error: "Unauthorized: Bearer token required" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const token = authHeader.split("Bearer ")[1];
+    if (token !== env.API_KEY) {
+      return new Response(JSON.stringify({ error: "Unauthorized: Invalid token" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     try {
       const body = await request.text();
       const { html, pdfOptions } = requestSchema.parse(JSON.parse(body));
@@ -41,12 +58,20 @@ export default {
         },
       });
     } catch (error) {
+      if (error instanceof SyntaxError) {
+        return new Response(JSON.stringify({ error: "Invalid JSON format" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       if (error instanceof ZodError) {
         return new Response(JSON.stringify({ error: "Invalid input", details: error.errors }), {
           status: 400,
           headers: { "Content-Type": "application/json" },
         });
       }
+
+      console.error(error);
       return new Response(JSON.stringify({ error: "Internal Server Error" }), {
         status: 500,
         headers: { "Content-Type": "application/json" },
@@ -60,7 +85,10 @@ async function generatePDF(browser: Browser, html: string, options?: PDFOptions)
 
   const page = await browser.newPage();
   await page.setContent(html);
-  const pdfBuffer = await page.pdf(options);
+  const pdfBuffer = await page.pdf({
+    format,
+    printBackground,
+  });
   await page.close();
 
   return pdfBuffer;
