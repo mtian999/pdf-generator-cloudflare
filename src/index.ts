@@ -17,6 +17,16 @@ const requestSchema = z.object({
 
 export default {
   async fetch(request, env, ctx): Promise<Response> {
+    if (request.method !== "POST") {
+      return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+        status: 405,
+        headers: {
+          "Content-Type": "application/json",
+          Allow: "POST",
+        },
+      });
+    }
+
     try {
       const body = await request.text();
       const { html, pdfOptions } = requestSchema.parse(JSON.parse(body));
