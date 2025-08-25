@@ -37,7 +37,7 @@ export default {
     }
 
     const token = authHeader.split("Bearer ")[1];
-    if (token !== env.API_KEY) {
+    if (token !== process.env.API_KEY) {
       return new Response(JSON.stringify({ error: "Unauthorized: Invalid token" }), {
         status: 401,
         headers: { "Content-Type": "application/json" },
