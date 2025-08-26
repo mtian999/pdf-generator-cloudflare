@@ -9,10 +9,10 @@
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat_v2"],
   "observability": {
-    "enabled": true,
+    "enabled": true
   },
   "browser": {
-    "binding": "MYBROWSER",
+    "binding": "MYBROWSER"
   },
   /**
    * Smart Placement
@@ -31,7 +31,7 @@
    * Environment Variables
    * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
    */
-  // "vars": { "MY_VARIABLE": "production_value" },
+  "vars": { "TAILWIND_CDN": "https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" }
   /**
    * Note: Use secrets to store sensitive data.
    * https://developers.cloudflare.com/workers/configuration/secrets/
