@@ -4,7 +4,7 @@
  */
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "pdf-generator",
+  "name": "pdf-generator-cloudflare",
   "main": "src/index.ts",
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat_v2"],
