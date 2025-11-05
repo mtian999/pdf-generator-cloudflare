@@ -56,14 +56,6 @@ const RATE_LIMIT_CONFIG = {
 const rateLimitCache = new Map<string, { count: number; resetTime: number; lastSync: number }>();
 let lastCleanupTime = 0;
 
-// Browser 连接池（保持打开，依赖自动超时）
-let cachedBrowser: Browser | null = null;
-let browserInUse = false;
-const browserQueue: Array<{ resolve: (browser: Browser) => void; reject: (error: Error) => void }> = [];
-
-// Browser API 速率限制追踪
-let browserApiRateLimitUntil = 0; // 记录 Browser API 被限制到什么时候
-
 // 惰性清理过期的缓存条目（在每次请求时检查，而不是用 setInterval）
 function cleanupExpiredCacheIfNeeded() {
   const now = Date.now();
@@ -92,97 +84,6 @@ function cleanupExpiredCacheIfNeeded() {
     const toDelete = entries.slice(0, rateLimitCache.size - MAX_CACHE_SIZE);
     toDelete.forEach(([key]) => rateLimitCache.delete(key));
     console.warn(`Rate limit cache exceeded ${MAX_CACHE_SIZE} entries, cleaned up ${toDelete.length} oldest entries`);
-  }
-}
-
-// 获取 Browser 实例（带队列管理和速率限制检查）
-async function acquireBrowser(env: Env): Promise<Browser> {
-  // 检查 Browser API 是否被限制
-  const now = Date.now();
-  if (now < browserApiRateLimitUntil) {
-    const waitSeconds = Math.ceil((browserApiRateLimitUntil - now) / 1000);
-    throw new Error(`Browser API rate limited. Retry after ${waitSeconds} seconds.`);
-  }
-
-  // 如果 browser 正在使用中，加入队列等待
-  if (browserInUse) {
-    return new Promise((resolve, reject) => {
-      browserQueue.push({ resolve, reject });
-    });
-  }
-
-  // 标记为使用中
-  browserInUse = true;
-
-  // 检查缓存的 browser 是否可用
-  if (cachedBrowser) {
-    try {
-      await cachedBrowser.version();
-      return cachedBrowser;
-    } catch (err) {
-      console.warn("Cached browser is no longer valid:", err);
-      cachedBrowser = null;
-    }
-  }
-
-  // 创建新的 browser 实例
-  try {
-    cachedBrowser = await puppeteer.launch(env.MYBROWSER);
-    return cachedBrowser;
-  } catch (error) {
-    browserInUse = false;
-
-    // 检查是否是 Browser API 速率限制
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    if (errorMessage.includes("429") || errorMessage.toLowerCase().includes("rate limit")) {
-      // 设置 Browser API 限制时间（60秒）
-      browserApiRateLimitUntil = Date.now() + 60000;
-      console.error("Browser API rate limit hit, blocking requests for 60 seconds");
-    }
-
-    processQueue(env);
-    throw error;
-  }
-}
-
-// 释放 Browser（不关闭，只标记为可用）
-function releaseBrowser() {
-  browserInUse = false;
-  processQueue(cachedBrowser);
-}
-
-// 处理等待队列
-function processQueue(browserOrEnv: Browser | Env | null) {
-  if (browserQueue.length === 0) {
-    return;
-  }
-
-  const next = browserQueue.shift();
-  if (!next) return;
-
-  browserInUse = true;
-
-  if (browserOrEnv && typeof (browserOrEnv as any).version === "function") {
-    // 是 Browser 实例
-    next.resolve(browserOrEnv as Browser);
-  } else if (browserOrEnv) {
-    // 是 Env，需要创建新 browser
-    const env = browserOrEnv as Env;
-    puppeteer
-      .launch(env.MYBROWSER)
-      .then((browser) => {
-        cachedBrowser = browser;
-        next.resolve(browser);
-      })
-      .catch((error) => {
-        browserInUse = false;
-        next.reject(error);
-        processQueue(env);
-      });
-  } else {
-    next.reject(new Error("Browser not available"));
-    browserInUse = false;
-    processQueue(null);
   }
 }
 
@@ -322,37 +223,7 @@ export default {
       const body = await request.text();
       const { html, pdfOptions } = requestSchema.parse(JSON.parse(body));
 
-      let browser: Browser;
-      try {
-        browser = await acquireBrowser(env);
-      } catch (launchError) {
-        // 检查是否是 Browser API 的速率限制错误
-        const errorMessage = launchError instanceof Error ? launchError.message : String(launchError);
-        if (errorMessage.includes("429") || errorMessage.toLowerCase().includes("rate limit")) {
-          // 计算实际的 retry after 时间
-          const retryAfter = Math.max(1, Math.ceil((browserApiRateLimitUntil - Date.now()) / 1000));
-
-          const response = new Response(
-            JSON.stringify({
-              error: "Browser API Rate Limit Exceeded",
-              message: "Cloudflare Browser Rendering API rate limit exceeded. Please try again later.",
-              details:
-                "The Browser Rendering API has a rate limit. Consider upgrading your plan or waiting before retrying.",
-              retryAfter,
-            }),
-            {
-              status: 429,
-              headers: {
-                "Content-Type": "application/json",
-                "Retry-After": retryAfter.toString(),
-              },
-            }
-          );
-          return addCorsHeaders(response, allowedOrigin);
-        }
-        // 如果不是速率限制错误，重新抛出
-        throw launchError;
-      }
+      const browser = await puppeteer.launch(env.MYBROWSER);
 
       try {
         const pdf = await generatePDF(env, browser, html, pdfOptions);
@@ -364,8 +235,7 @@ export default {
         });
         return addCorsHeaders(response, allowedOrigin);
       } finally {
-        // 释放 browser（不关闭，只标记为可用）
-        releaseBrowser();
+        await browser.close();
       }
     } catch (error) {
       if (error instanceof SyntaxError) {
