@@ -49,10 +49,19 @@ const RATE_LIMIT_CONFIG = {
 
 // 内存缓存，减少 KV 写入次数
 const rateLimitCache = new Map<string, { count: number; resetTime: number; lastSync: number }>();
+let lastCleanupTime = 0;
 
-// 定期清理过期的缓存条目，防止内存泄漏
-function cleanupExpiredCache() {
+// 惰性清理过期的缓存条目（在每次请求时检查，而不是用 setInterval）
+function cleanupExpiredCacheIfNeeded() {
   const now = Date.now();
+  const CLEANUP_INTERVAL = 300000; // 5 分钟
+
+  // 只在距离上次清理超过 5 分钟时才执行
+  if (now - lastCleanupTime < CLEANUP_INTERVAL) {
+    return;
+  }
+
+  lastCleanupTime = now;
   for (const [key, value] of rateLimitCache.entries()) {
     if (now > value.resetTime + 60000) {
       // 过期 1 分钟后删除
@@ -61,9 +70,6 @@ function cleanupExpiredCache() {
   }
 }
 
-// 每 5 分钟清理一次过期缓存
-setInterval(cleanupExpiredCache, 300000);
-
 // 检查速率限制（优化版：减少 KV 写入 + 容错处理）
 async function checkRateLimit(
   env: Env,
@@ -71,7 +77,7 @@ async function checkRateLimit(
 ): Promise<{ allowed: boolean; remaining: number; resetTime: number }> {
   const key = `ratelimit:${identifier}`;
   const now = Date.now();
-  const SYNC_INTERVAL = 10000; // 每 10 秒同步一次到 KV，大幅减少写入次数
+  const SYNC_INTERVAL = 30000; // 每 10 秒同步一次到 KV，大幅减少写入次数
 
   // 先检查内存缓存
   let cached = rateLimitCache.get(key);
@@ -121,9 +127,12 @@ async function checkRateLimit(
   // 增加计数
   cached.count++;
   const shouldSync = now - cached.lastSync > SYNC_INTERVAL;
+  const isNearLimit = cached.count >= RATE_LIMIT_CONFIG.maxRequests * 0.8; // 达到80%阈值
 
-  // 只在达到同步间隔时写入 KV（大幅减少写入次数）
-  if (shouldSync) {
+  // 在以下情况立即同步到 KV：
+  // 1. 达到同步间隔（正常流量）
+  // 2. 接近限制阈值（防止机器人在10秒内绕过限制）
+  if (shouldSync || isNearLimit) {
     cached.lastSync = now;
     env.RATE_LIMIT_KV.put(key, JSON.stringify({ count: cached.count, resetTime: cached.resetTime }), {
       expirationTtl: Math.ceil((cached.resetTime - now) / 1000),
@@ -177,6 +186,9 @@ export default {
       });
       return addCorsHeaders(response, allowedOrigin);
     }
+
+    // 惰性清理过期缓存（每 5 分钟执行一次）
+    cleanupExpiredCacheIfNeeded();
 
     // 速率限制检查（基于 IP 地址）
     const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
