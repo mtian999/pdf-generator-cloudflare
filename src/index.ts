@@ -313,34 +313,10 @@ export default {
       return addCorsHeaders(response, allowedOrigin);
     }
 
-    // 惰性清理过期缓存（每 5 分钟执行一次）
-    cleanupExpiredCacheIfNeeded();
-
-    // 速率限制检查（基于 IP 地址）
-    const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
-    const rateLimitResult = await checkRateLimit(env, ctx, clientIP);
-
-    if (!rateLimitResult.allowed) {
-      const retryAfter = Math.max(1, Math.ceil((rateLimitResult.resetTime - Date.now()) / 1000));
-      const response = new Response(
-        JSON.stringify({
-          error: "Too Many Requests",
-          message: `Rate limit exceeded. Try again in ${retryAfter} seconds.`,
-          retryAfter,
-        }),
-        {
-          status: 429,
-          headers: {
-            "Content-Type": "application/json",
-            "Retry-After": retryAfter.toString(),
-            "X-RateLimit-Limit": RATE_LIMIT_CONFIG.maxRequests.toString(),
-            "X-RateLimit-Remaining": "0",
-            "X-RateLimit-Reset": new Date(rateLimitResult.resetTime).toISOString(),
-          },
-        }
-      );
-      return addCorsHeaders(response, allowedOrigin);
-    }
+    // 速率限制已禁用
+    // cleanupExpiredCacheIfNeeded();
+    // const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
+    // const rateLimitResult = await checkRateLimit(env, ctx, clientIP);
 
     try {
       const body = await request.text();
@@ -384,9 +360,6 @@ export default {
         const response = new Response(pdf, {
           headers: {
             "Content-Type": "application/pdf",
-            "X-RateLimit-Limit": RATE_LIMIT_CONFIG.maxRequests.toString(),
-            "X-RateLimit-Remaining": rateLimitResult.remaining.toString(),
-            "X-RateLimit-Reset": new Date(rateLimitResult.resetTime).toISOString(),
           },
         });
         return addCorsHeaders(response, allowedOrigin);
