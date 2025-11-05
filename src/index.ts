@@ -8,6 +8,11 @@ interface Env {
   RATE_LIMIT_KV: KVNamespace; // 用于存储速率限制数据
 }
 
+interface ExecutionContext {
+  waitUntil(promise: Promise<any>): void;
+  passThroughOnException(): void;
+}
+
 const requestSchema = z.object({
   html: z.string(),
   pdfOptions: z
@@ -47,9 +52,14 @@ const RATE_LIMIT_CONFIG = {
   windowMs: 60000, // 时间窗口（毫秒），60000 = 1分钟
 };
 
-// 内存缓存，减少 KV 写入次数
+// 内存缓存，减少 KV 写入次数（注意：Workers 可能随时重启，此缓存不保证持久）
 const rateLimitCache = new Map<string, { count: number; resetTime: number; lastSync: number }>();
 let lastCleanupTime = 0;
+
+// Browser 连接池（尽力而为，Worker 重启时会丢失）
+let cachedBrowser: Browser | null = null;
+let browserLastUsed = 0;
+const BROWSER_IDLE_TIMEOUT = 60000; // 60 秒无使用后关闭
 
 // 惰性清理过期的缓存条目（在每次请求时检查，而不是用 setInterval）
 function cleanupExpiredCacheIfNeeded() {
@@ -70,73 +80,119 @@ function cleanupExpiredCacheIfNeeded() {
   }
 }
 
+// 获取或创建 Browser 实例（尽力而为的连接池，完全依赖主动检查）
+async function getBrowser(env: Env): Promise<Browser> {
+  const now = Date.now();
+
+  // 主动检查并清理过期的 browser（每次请求时检查）
+  if (cachedBrowser && now - browserLastUsed >= BROWSER_IDLE_TIMEOUT) {
+    console.log("Browser idle timeout reached, closing...");
+    try {
+      await cachedBrowser.close();
+    } catch (err) {
+      console.warn("Failed to close idle browser:", err);
+    }
+    cachedBrowser = null;
+  }
+
+  // 检查是否有缓存的 browser 且未超时
+  if (cachedBrowser) {
+    try {
+      // 验证 browser 是否仍然可用
+      await cachedBrowser.version();
+      browserLastUsed = now;
+      return cachedBrowser;
+    } catch (err) {
+      // Browser 已失效（可能是远程会话超时），清理引用
+      console.warn("Cached browser is no longer valid, creating new one:", err);
+      cachedBrowser = null;
+    }
+  }
+
+  // 创建新的 browser 实例
+  console.log("Creating new browser instance");
+  cachedBrowser = await puppeteer.launch(env.MYBROWSER);
+  browserLastUsed = now;
+  return cachedBrowser;
+}
+
 // 检查速率限制（优化版：减少 KV 写入 + 容错处理）
 async function checkRateLimit(
   env: Env,
+  ctx: ExecutionContext,
   identifier: string
 ): Promise<{ allowed: boolean; remaining: number; resetTime: number }> {
   const key = `ratelimit:${identifier}`;
   const now = Date.now();
-  const SYNC_INTERVAL = 30000; // 每 10 秒同步一次到 KV，大幅减少写入次数
+  const SYNC_INTERVAL = 30000; // 每 30 秒同步一次到 KV，大幅减少写入次数
 
   // 先检查内存缓存
   let cached = rateLimitCache.get(key);
 
-  // 如果缓存不存在或已过期，从 KV 读取
-  if (!cached || now > cached.resetTime) {
+  // 只有在缓存不存在时才从 KV 读取，如果缓存存在但已过期，则重置计数
+  if (!cached) {
     try {
       const data = (await env.RATE_LIMIT_KV.get(key, "json")) as { count: number; resetTime: number } | null;
 
-      if (!data || now > (data.resetTime || 0)) {
-        // 新的时间窗口
-        const resetTime = now + RATE_LIMIT_CONFIG.windowMs;
-        cached = { count: 1, resetTime, lastSync: now };
+      if (data && now <= data.resetTime) {
+        // KV 中有有效数据，使用它
+        cached = { ...data, lastSync: now };
         rateLimitCache.set(key, cached);
-
-        // 异步写入 KV，不阻塞响应
-        env.RATE_LIMIT_KV.put(key, JSON.stringify({ count: 1, resetTime }), {
-          expirationTtl: Math.ceil(RATE_LIMIT_CONFIG.windowMs / 1000),
-        }).catch((err) => console.error("KV write error (quota exceeded?):", err));
-
-        return { allowed: true, remaining: RATE_LIMIT_CONFIG.maxRequests - 1, resetTime };
+      } else {
+        // KV 中没有数据或已过期，创建新的时间窗口
+        const resetTime = now + RATE_LIMIT_CONFIG.windowMs;
+        cached = { count: 0, resetTime, lastSync: now };
+        rateLimitCache.set(key, cached);
       }
-
-      // 使用 KV 中的数据更新缓存
-      cached = { ...data, lastSync: now };
-      rateLimitCache.set(key, cached);
     } catch (kvError) {
       // KV 读取失败（可能超出额度），使用纯内存模式降级
       console.error("KV read error (quota exceeded?), falling back to memory-only mode:", kvError);
-
-      if (!cached) {
-        // 如果内存中也没有，创建新的时间窗口
-        const resetTime = now + RATE_LIMIT_CONFIG.windowMs;
-        cached = { count: 1, resetTime, lastSync: now };
-        rateLimitCache.set(key, cached);
-        return { allowed: true, remaining: RATE_LIMIT_CONFIG.maxRequests - 1, resetTime };
-      }
-      // 如果内存中有旧数据，继续使用（虽然可能不准确，但总比完全失败好）
+      const resetTime = now + RATE_LIMIT_CONFIG.windowMs;
+      cached = { count: 0, resetTime, lastSync: now };
+      rateLimitCache.set(key, cached);
     }
-  }
-
-  // 检查是否超过限制
-  if (cached.count >= RATE_LIMIT_CONFIG.maxRequests) {
-    return { allowed: false, remaining: 0, resetTime: cached.resetTime };
+  } else if (now > cached.resetTime) {
+    // 缓存存在但时间窗口已过期，重置计数
+    cached.count = 0;
+    cached.resetTime = now + RATE_LIMIT_CONFIG.windowMs;
+    cached.lastSync = now;
   }
 
   // 增加计数
   cached.count++;
+
+  // 检查是否超过限制
+  if (cached.count > RATE_LIMIT_CONFIG.maxRequests) {
+    // 超过限制，恢复计数并拒绝请求
+    cached.count--;
+    return { allowed: false, remaining: 0, resetTime: cached.resetTime };
+  }
+
   const shouldSync = now - cached.lastSync > SYNC_INTERVAL;
   const isNearLimit = cached.count >= RATE_LIMIT_CONFIG.maxRequests * 0.8; // 达到80%阈值
+  const isFirstRequest = cached.count === 1;
 
-  // 在以下情况立即同步到 KV：
-  // 1. 达到同步间隔（正常流量）
-  // 2. 接近限制阈值（防止机器人在10秒内绕过限制）
-  if (shouldSync || isNearLimit) {
+  // 在以下情况同步到 KV：
+  // 1. 第一个请求（确保 KV 中有数据）
+  // 2. 达到同步间隔（正常流量）
+  // 3. 接近限制阈值（防止机器人在30秒内绕过限制）
+  if (isFirstRequest || shouldSync || isNearLimit) {
     cached.lastSync = now;
-    env.RATE_LIMIT_KV.put(key, JSON.stringify({ count: cached.count, resetTime: cached.resetTime }), {
-      expirationTtl: Math.ceil((cached.resetTime - now) / 1000),
-    }).catch((err) => console.error("KV write error (quota exceeded?):", err));
+    const kvWritePromise = env.RATE_LIMIT_KV.put(
+      key,
+      JSON.stringify({ count: cached.count, resetTime: cached.resetTime }),
+      {
+        expirationTtl: Math.ceil((cached.resetTime - now) / 1000) + 60, // 多加60秒防止提前过期
+      }
+    ).catch((err) => console.error("KV write error (quota exceeded?):", err));
+
+    // 对于第一个请求和接近限制的情况，等待 KV 写入完成以确保数据一致性
+    if (isFirstRequest || isNearLimit) {
+      await kvWritePromise;
+    } else {
+      // 正常同步间隔，使用 waitUntil 确保异步写入完成
+      ctx.waitUntil(kvWritePromise);
+    }
   }
 
   return {
@@ -147,7 +203,7 @@ async function checkRateLimit(
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // 获取请求源并检查是否在允许列表中
     const origin = request.headers.get("Origin");
     const allowedOrigin = origin && allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
@@ -192,7 +248,7 @@ export default {
 
     // 速率限制检查（基于 IP 地址）
     const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
-    const rateLimitResult = await checkRateLimit(env, clientIP);
+    const rateLimitResult = await checkRateLimit(env, ctx, clientIP);
 
     if (!rateLimitResult.allowed) {
       const retryAfter = Math.max(1, Math.ceil((rateLimitResult.resetTime - Date.now()) / 1000));
@@ -216,12 +272,11 @@ export default {
       return addCorsHeaders(response, allowedOrigin);
     }
 
-    let browser: Browser | null = null;
     try {
       const body = await request.text();
       const { html, pdfOptions } = requestSchema.parse(JSON.parse(body));
 
-      browser = await puppeteer.launch(env.MYBROWSER);
+      const browser = await getBrowser(env);
       const pdf = await generatePDF(env, browser, html, pdfOptions);
 
       const response = new Response(pdf, {
@@ -255,11 +310,6 @@ export default {
         headers: { "Content-Type": "application/json" },
       });
       return addCorsHeaders(response, allowedOrigin);
-    } finally {
-      // 确保 browser 正确关闭，避免资源泄漏
-      if (browser) {
-        await browser.close();
-      }
     }
   },
 } satisfies ExportedHandler<Env>;
@@ -269,27 +319,31 @@ async function generatePDF(env: Env, browser: Browser, html: string, options?: P
 
   const page = await browser.newPage();
 
-  // 设置页面内容
-  await page.setContent(html, {
-    waitUntil: ["networkidle0", "load", "domcontentloaded"],
-    timeout: 30000,
-  });
-
-  // 添加 Tailwind CSS
   try {
-    await page.addStyleTag({
-      url: env.TAILWIND_CDN,
+    // 设置页面内容
+    await page.setContent(html, {
+      waitUntil: ["networkidle0", "load", "domcontentloaded"],
+      timeout: 30000,
     });
-  } catch (styleError) {
-    console.warn("Failed to load Tailwind CSS:", styleError);
-    // 继续执行，不阻止 PDF 生成
+
+    // 添加 Tailwind CSS
+    try {
+      await page.addStyleTag({
+        url: env.TAILWIND_CDN,
+      });
+    } catch (styleError) {
+      console.warn("Failed to load Tailwind CSS:", styleError);
+      // 继续执行，不阻止 PDF 生成
+    }
+
+    const pdfBuffer = await page.pdf({
+      format,
+      printBackground,
+    });
+
+    return pdfBuffer;
+  } finally {
+    // 确保 page 总是被关闭
+    await page.close();
   }
-
-  const pdfBuffer = await page.pdf({
-    format,
-    printBackground,
-  });
-  await page.close();
-
-  return pdfBuffer;
 }
