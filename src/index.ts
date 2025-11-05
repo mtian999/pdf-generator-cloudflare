@@ -56,6 +56,11 @@ const RATE_LIMIT_CONFIG = {
 const rateLimitCache = new Map<string, { count: number; resetTime: number; lastSync: number }>();
 let lastCleanupTime = 0;
 
+// Browser 连接池（保持打开，依赖自动超时）
+let cachedBrowser: Browser | null = null;
+let browserInUse = false;
+const browserQueue: Array<{ resolve: (browser: Browser) => void; reject: (error: Error) => void }> = [];
+
 // 惰性清理过期的缓存条目（在每次请求时检查，而不是用 setInterval）
 function cleanupExpiredCacheIfNeeded() {
   const now = Date.now();
@@ -72,6 +77,81 @@ function cleanupExpiredCacheIfNeeded() {
       // 过期 1 分钟后删除
       rateLimitCache.delete(key);
     }
+  }
+}
+
+// 获取 Browser 实例（带队列管理，避免并发冲突）
+async function acquireBrowser(env: Env): Promise<Browser> {
+  // 如果 browser 正在使用中，加入队列等待
+  if (browserInUse) {
+    return new Promise((resolve, reject) => {
+      browserQueue.push({ resolve, reject });
+    });
+  }
+
+  // 标记为使用中
+  browserInUse = true;
+
+  // 检查缓存的 browser 是否可用
+  if (cachedBrowser) {
+    try {
+      await cachedBrowser.version();
+      return cachedBrowser;
+    } catch (err) {
+      console.warn("Cached browser is no longer valid:", err);
+      cachedBrowser = null;
+    }
+  }
+
+  // 创建新的 browser 实例
+  try {
+    cachedBrowser = await puppeteer.launch(env.MYBROWSER);
+    return cachedBrowser;
+  } catch (error) {
+    browserInUse = false;
+    processQueue(env);
+    throw error;
+  }
+}
+
+// 释放 Browser（不关闭，只标记为可用）
+function releaseBrowser() {
+  browserInUse = false;
+  processQueue(cachedBrowser);
+}
+
+// 处理等待队列
+function processQueue(browserOrEnv: Browser | Env | null) {
+  if (browserQueue.length === 0) {
+    return;
+  }
+
+  const next = browserQueue.shift();
+  if (!next) return;
+
+  browserInUse = true;
+
+  if (browserOrEnv && typeof (browserOrEnv as any).version === "function") {
+    // 是 Browser 实例
+    next.resolve(browserOrEnv as Browser);
+  } else if (browserOrEnv) {
+    // 是 Env，需要创建新 browser
+    const env = browserOrEnv as Env;
+    puppeteer
+      .launch(env.MYBROWSER)
+      .then((browser) => {
+        cachedBrowser = browser;
+        next.resolve(browser);
+      })
+      .catch((error) => {
+        browserInUse = false;
+        next.reject(error);
+        processQueue(env);
+      });
+  } else {
+    next.reject(new Error("Browser not available"));
+    browserInUse = false;
+    processQueue(null);
   }
 }
 
@@ -231,23 +311,55 @@ export default {
       return addCorsHeaders(response, allowedOrigin);
     }
 
-    let browser: Browser | null = null;
     try {
       const body = await request.text();
       const { html, pdfOptions } = requestSchema.parse(JSON.parse(body));
 
-      browser = await puppeteer.launch(env.MYBROWSER);
-      const pdf = await generatePDF(env, browser, html, pdfOptions);
+      let browser: Browser;
+      try {
+        browser = await acquireBrowser(env);
+      } catch (launchError) {
+        // 检查是否是 Browser API 的速率限制错误
+        const errorMessage = launchError instanceof Error ? launchError.message : String(launchError);
+        if (errorMessage.includes("429") || errorMessage.includes("Rate limit exceeded")) {
+          const response = new Response(
+            JSON.stringify({
+              error: "Browser API Rate Limit Exceeded",
+              message: "Cloudflare Browser Rendering API rate limit exceeded. Please try again later.",
+              details:
+                "The Browser Rendering API has a rate limit. Consider upgrading your plan or waiting before retrying.",
+              retryAfter: 60,
+            }),
+            {
+              status: 429,
+              headers: {
+                "Content-Type": "application/json",
+                "Retry-After": "60",
+              },
+            }
+          );
+          return addCorsHeaders(response, allowedOrigin);
+        }
+        // 如果不是速率限制错误，重新抛出
+        throw launchError;
+      }
 
-      const response = new Response(pdf, {
-        headers: {
-          "Content-Type": "application/pdf",
-          "X-RateLimit-Limit": RATE_LIMIT_CONFIG.maxRequests.toString(),
-          "X-RateLimit-Remaining": rateLimitResult.remaining.toString(),
-          "X-RateLimit-Reset": new Date(rateLimitResult.resetTime).toISOString(),
-        },
-      });
-      return addCorsHeaders(response, allowedOrigin);
+      try {
+        const pdf = await generatePDF(env, browser, html, pdfOptions);
+
+        const response = new Response(pdf, {
+          headers: {
+            "Content-Type": "application/pdf",
+            "X-RateLimit-Limit": RATE_LIMIT_CONFIG.maxRequests.toString(),
+            "X-RateLimit-Remaining": rateLimitResult.remaining.toString(),
+            "X-RateLimit-Reset": new Date(rateLimitResult.resetTime).toISOString(),
+          },
+        });
+        return addCorsHeaders(response, allowedOrigin);
+      } finally {
+        // 释放 browser（不关闭，只标记为可用）
+        releaseBrowser();
+      }
     } catch (error) {
       if (error instanceof SyntaxError) {
         const response = new Response(
@@ -298,11 +410,6 @@ export default {
         }
       );
       return addCorsHeaders(response, allowedOrigin);
-    } finally {
-      // 确保 browser 正确关闭，避免资源泄漏
-      if (browser) {
-        await browser.close();
-      }
     }
   },
 } satisfies ExportedHandler<Env>;
