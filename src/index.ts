@@ -47,42 +47,98 @@ const RATE_LIMIT_CONFIG = {
   windowMs: 60000, // 时间窗口（毫秒），60000 = 1分钟
 };
 
-// 检查速率限制
+// 内存缓存，减少 KV 写入次数
+const rateLimitCache = new Map<string, { count: number; resetTime: number; lastSync: number }>();
+
+// 定期清理过期的缓存条目，防止内存泄漏
+function cleanupExpiredCache() {
+  const now = Date.now();
+  for (const [key, value] of rateLimitCache.entries()) {
+    if (now > value.resetTime + 60000) {
+      // 过期 1 分钟后删除
+      rateLimitCache.delete(key);
+    }
+  }
+}
+
+// 每 5 分钟清理一次过期缓存
+setInterval(cleanupExpiredCache, 300000);
+
+// 检查速率限制（优化版：减少 KV 写入 + 容错处理）
 async function checkRateLimit(
   env: Env,
   identifier: string
 ): Promise<{ allowed: boolean; remaining: number; resetTime: number }> {
   const key = `ratelimit:${identifier}`;
   const now = Date.now();
+  const SYNC_INTERVAL = 10000; // 每 10 秒同步一次到 KV，大幅减少写入次数
 
-  // 从 KV 获取当前计数
-  const data = (await env.RATE_LIMIT_KV.get(key, "json")) as { count: number; resetTime: number } | null;
+  // 先检查内存缓存
+  let cached = rateLimitCache.get(key);
 
-  if (!data || now > data.resetTime) {
-    // 新的时间窗口
-    const resetTime = now + RATE_LIMIT_CONFIG.windowMs;
-    await env.RATE_LIMIT_KV.put(key, JSON.stringify({ count: 1, resetTime }), {
-      expirationTtl: Math.ceil(RATE_LIMIT_CONFIG.windowMs / 1000),
-    });
-    return { allowed: true, remaining: RATE_LIMIT_CONFIG.maxRequests - 1, resetTime };
+  // 如果缓存不存在或已过期，从 KV 读取
+  if (!cached || now > cached.resetTime) {
+    try {
+      const data = (await env.RATE_LIMIT_KV.get(key, "json")) as { count: number; resetTime: number } | null;
+
+      if (!data || now > (data.resetTime || 0)) {
+        // 新的时间窗口
+        const resetTime = now + RATE_LIMIT_CONFIG.windowMs;
+        cached = { count: 1, resetTime, lastSync: now };
+        rateLimitCache.set(key, cached);
+
+        // 异步写入 KV，不阻塞响应
+        env.RATE_LIMIT_KV.put(key, JSON.stringify({ count: 1, resetTime }), {
+          expirationTtl: Math.ceil(RATE_LIMIT_CONFIG.windowMs / 1000),
+        }).catch((err) => console.error("KV write error (quota exceeded?):", err));
+
+        return { allowed: true, remaining: RATE_LIMIT_CONFIG.maxRequests - 1, resetTime };
+      }
+
+      // 使用 KV 中的数据更新缓存
+      cached = { ...data, lastSync: now };
+      rateLimitCache.set(key, cached);
+    } catch (kvError) {
+      // KV 读取失败（可能超出额度），使用纯内存模式降级
+      console.error("KV read error (quota exceeded?), falling back to memory-only mode:", kvError);
+
+      if (!cached) {
+        // 如果内存中也没有，创建新的时间窗口
+        const resetTime = now + RATE_LIMIT_CONFIG.windowMs;
+        cached = { count: 1, resetTime, lastSync: now };
+        rateLimitCache.set(key, cached);
+        return { allowed: true, remaining: RATE_LIMIT_CONFIG.maxRequests - 1, resetTime };
+      }
+      // 如果内存中有旧数据，继续使用（虽然可能不准确，但总比完全失败好）
+    }
   }
 
-  if (data.count >= RATE_LIMIT_CONFIG.maxRequests) {
-    // 超过限制
-    return { allowed: false, remaining: 0, resetTime: data.resetTime };
+  // 检查是否超过限制
+  if (cached.count >= RATE_LIMIT_CONFIG.maxRequests) {
+    return { allowed: false, remaining: 0, resetTime: cached.resetTime };
   }
 
   // 增加计数
-  const newCount = data.count + 1;
-  await env.RATE_LIMIT_KV.put(key, JSON.stringify({ count: newCount, resetTime: data.resetTime }), {
-    expirationTtl: Math.ceil((data.resetTime - now) / 1000),
-  });
+  cached.count++;
+  const shouldSync = now - cached.lastSync > SYNC_INTERVAL;
 
-  return { allowed: true, remaining: RATE_LIMIT_CONFIG.maxRequests - newCount, resetTime: data.resetTime };
+  // 只在达到同步间隔时写入 KV（大幅减少写入次数）
+  if (shouldSync) {
+    cached.lastSync = now;
+    env.RATE_LIMIT_KV.put(key, JSON.stringify({ count: cached.count, resetTime: cached.resetTime }), {
+      expirationTtl: Math.ceil((cached.resetTime - now) / 1000),
+    }).catch((err) => console.error("KV write error (quota exceeded?):", err));
+  }
+
+  return {
+    allowed: true,
+    remaining: RATE_LIMIT_CONFIG.maxRequests - cached.count,
+    resetTime: cached.resetTime,
+  };
 }
 
 export default {
-  async fetch(request, env, ctx): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     // 获取请求源并检查是否在允许列表中
     const origin = request.headers.get("Origin");
     const allowedOrigin = origin && allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
@@ -127,7 +183,7 @@ export default {
     const rateLimitResult = await checkRateLimit(env, clientIP);
 
     if (!rateLimitResult.allowed) {
-      const retryAfter = Math.ceil((rateLimitResult.resetTime - Date.now()) / 1000);
+      const retryAfter = Math.max(1, Math.ceil((rateLimitResult.resetTime - Date.now()) / 1000));
       const response = new Response(
         JSON.stringify({
           error: "Too Many Requests",
@@ -148,13 +204,13 @@ export default {
       return addCorsHeaders(response, allowedOrigin);
     }
 
+    let browser: Browser | null = null;
     try {
       const body = await request.text();
       const { html, pdfOptions } = requestSchema.parse(JSON.parse(body));
 
-      const browser = await puppeteer.launch(env.MYBROWSER);
+      browser = await puppeteer.launch(env.MYBROWSER);
       const pdf = await generatePDF(env, browser, html, pdfOptions);
-      browser.close();
 
       const response = new Response(pdf, {
         headers: {
@@ -187,6 +243,11 @@ export default {
         headers: { "Content-Type": "application/json" },
       });
       return addCorsHeaders(response, allowedOrigin);
+    } finally {
+      // 确保 browser 正确关闭，避免资源泄漏
+      if (browser) {
+        await browser.close();
+      }
     }
   },
 } satisfies ExportedHandler<Env>;
