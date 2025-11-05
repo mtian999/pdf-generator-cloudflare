@@ -61,10 +61,14 @@ let cachedBrowser: Browser | null = null;
 let browserInUse = false;
 const browserQueue: Array<{ resolve: (browser: Browser) => void; reject: (error: Error) => void }> = [];
 
+// Browser API 速率限制追踪
+let browserApiRateLimitUntil = 0; // 记录 Browser API 被限制到什么时候
+
 // 惰性清理过期的缓存条目（在每次请求时检查，而不是用 setInterval）
 function cleanupExpiredCacheIfNeeded() {
   const now = Date.now();
   const CLEANUP_INTERVAL = 300000; // 5 分钟
+  const MAX_CACHE_SIZE = 1000; // 最大缓存条目数
 
   // 只在距离上次清理超过 5 分钟时才执行
   if (now - lastCleanupTime < CLEANUP_INTERVAL) {
@@ -72,16 +76,34 @@ function cleanupExpiredCacheIfNeeded() {
   }
 
   lastCleanupTime = now;
+
+  // 清理过期条目
   for (const [key, value] of rateLimitCache.entries()) {
     if (now > value.resetTime + 60000) {
       // 过期 1 分钟后删除
       rateLimitCache.delete(key);
     }
   }
+
+  // 如果缓存仍然太大，删除最旧的条目
+  if (rateLimitCache.size > MAX_CACHE_SIZE) {
+    const entries = Array.from(rateLimitCache.entries());
+    entries.sort((a, b) => a[1].resetTime - b[1].resetTime);
+    const toDelete = entries.slice(0, rateLimitCache.size - MAX_CACHE_SIZE);
+    toDelete.forEach(([key]) => rateLimitCache.delete(key));
+    console.warn(`Rate limit cache exceeded ${MAX_CACHE_SIZE} entries, cleaned up ${toDelete.length} oldest entries`);
+  }
 }
 
-// 获取 Browser 实例（带队列管理，避免并发冲突）
+// 获取 Browser 实例（带队列管理和速率限制检查）
 async function acquireBrowser(env: Env): Promise<Browser> {
+  // 检查 Browser API 是否被限制
+  const now = Date.now();
+  if (now < browserApiRateLimitUntil) {
+    const waitSeconds = Math.ceil((browserApiRateLimitUntil - now) / 1000);
+    throw new Error(`Browser API rate limited. Retry after ${waitSeconds} seconds.`);
+  }
+
   // 如果 browser 正在使用中，加入队列等待
   if (browserInUse) {
     return new Promise((resolve, reject) => {
@@ -109,6 +131,15 @@ async function acquireBrowser(env: Env): Promise<Browser> {
     return cachedBrowser;
   } catch (error) {
     browserInUse = false;
+
+    // 检查是否是 Browser API 速率限制
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (errorMessage.includes("429") || errorMessage.toLowerCase().includes("rate limit")) {
+      // 设置 Browser API 限制时间（60秒）
+      browserApiRateLimitUntil = Date.now() + 60000;
+      console.error("Browser API rate limit hit, blocking requests for 60 seconds");
+    }
+
     processQueue(env);
     throw error;
   }
@@ -321,20 +352,23 @@ export default {
       } catch (launchError) {
         // 检查是否是 Browser API 的速率限制错误
         const errorMessage = launchError instanceof Error ? launchError.message : String(launchError);
-        if (errorMessage.includes("429") || errorMessage.includes("Rate limit exceeded")) {
+        if (errorMessage.includes("429") || errorMessage.toLowerCase().includes("rate limit")) {
+          // 计算实际的 retry after 时间
+          const retryAfter = Math.max(1, Math.ceil((browserApiRateLimitUntil - Date.now()) / 1000));
+
           const response = new Response(
             JSON.stringify({
               error: "Browser API Rate Limit Exceeded",
               message: "Cloudflare Browser Rendering API rate limit exceeded. Please try again later.",
               details:
                 "The Browser Rendering API has a rate limit. Consider upgrading your plan or waiting before retrying.",
-              retryAfter: 60,
+              retryAfter,
             }),
             {
               status: 429,
               headers: {
                 "Content-Type": "application/json",
-                "Retry-After": "60",
+                "Retry-After": retryAfter.toString(),
               },
             }
           );
