@@ -223,7 +223,32 @@ export default {
       const body = await request.text();
       const { html, pdfOptions } = requestSchema.parse(JSON.parse(body));
 
-      const browser = await puppeteer.launch(env.MYBROWSER);
+      let browser;
+      try {
+        browser = await puppeteer.launch(env.MYBROWSER);
+      } catch (launchError: any) {
+        // 处理 429 错误（浏览器速率限制）
+        if (launchError?.message?.includes("429") || launchError?.statusCode === 429) {
+          const response = new Response(
+            JSON.stringify({
+              error: "Rate Limit Exceeded",
+              message:
+                "Browser service rate limit exceeded, please try again later / 浏览器服务请求过于频繁，请稍后再试",
+              retryAfter: "20 seconds",
+            }),
+            {
+              status: 429,
+              headers: {
+                "Content-Type": "application/json",
+                "Retry-After": "20",
+              },
+            }
+          );
+          return addCorsHeaders(response, allowedOrigin);
+        }
+        // 重新抛出其他错误
+        throw launchError;
+      }
 
       try {
         const pdf = await generatePDF(env, browser, html, pdfOptions);
