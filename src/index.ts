@@ -56,11 +56,6 @@ const RATE_LIMIT_CONFIG = {
 const rateLimitCache = new Map<string, { count: number; resetTime: number; lastSync: number }>();
 let lastCleanupTime = 0;
 
-// Browser 连接池（尽力而为，Worker 重启时会丢失）
-let cachedBrowser: Browser | null = null;
-let browserLastUsed = 0;
-const BROWSER_IDLE_TIMEOUT = 60000; // 60 秒无使用后关闭
-
 // 惰性清理过期的缓存条目（在每次请求时检查，而不是用 setInterval）
 function cleanupExpiredCacheIfNeeded() {
   const now = Date.now();
@@ -78,42 +73,6 @@ function cleanupExpiredCacheIfNeeded() {
       rateLimitCache.delete(key);
     }
   }
-}
-
-// 获取或创建 Browser 实例（尽力而为的连接池，完全依赖主动检查）
-async function getBrowser(env: Env): Promise<Browser> {
-  const now = Date.now();
-
-  // 主动检查并清理过期的 browser（每次请求时检查）
-  if (cachedBrowser && now - browserLastUsed >= BROWSER_IDLE_TIMEOUT) {
-    console.log("Browser idle timeout reached, closing...");
-    try {
-      await cachedBrowser.close();
-    } catch (err) {
-      console.warn("Failed to close idle browser:", err);
-    }
-    cachedBrowser = null;
-  }
-
-  // 检查是否有缓存的 browser 且未超时
-  if (cachedBrowser) {
-    try {
-      // 验证 browser 是否仍然可用
-      await cachedBrowser.version();
-      browserLastUsed = now;
-      return cachedBrowser;
-    } catch (err) {
-      // Browser 已失效（可能是远程会话超时），清理引用
-      console.warn("Cached browser is no longer valid, creating new one:", err);
-      cachedBrowser = null;
-    }
-  }
-
-  // 创建新的 browser 实例
-  console.log("Creating new browser instance");
-  cachedBrowser = await puppeteer.launch(env.MYBROWSER);
-  browserLastUsed = now;
-  return cachedBrowser;
 }
 
 // 检查速率限制（优化版：减少 KV 写入 + 容错处理）
@@ -272,11 +231,12 @@ export default {
       return addCorsHeaders(response, allowedOrigin);
     }
 
+    let browser: Browser | null = null;
     try {
       const body = await request.text();
       const { html, pdfOptions } = requestSchema.parse(JSON.parse(body));
 
-      const browser = await getBrowser(env);
+      browser = await puppeteer.launch(env.MYBROWSER);
       const pdf = await generatePDF(env, browser, html, pdfOptions);
 
       const response = new Response(pdf, {
@@ -290,26 +250,59 @@ export default {
       return addCorsHeaders(response, allowedOrigin);
     } catch (error) {
       if (error instanceof SyntaxError) {
-        const response = new Response(JSON.stringify({ error: "Invalid JSON format" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
+        const response = new Response(
+          JSON.stringify({
+            error: "Invalid JSON format",
+            message: "Request body must be valid JSON",
+            details: error.message,
+          }),
+          {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
         return addCorsHeaders(response, allowedOrigin);
       }
       if (error instanceof ZodError) {
-        const response = new Response(JSON.stringify({ error: "Invalid input", details: error.errors }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
+        const response = new Response(
+          JSON.stringify({
+            error: "Invalid input",
+            message: "Request validation failed",
+            details: error.errors,
+          }),
+          {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
         return addCorsHeaders(response, allowedOrigin);
       }
 
-      console.error(error);
-      const response = new Response(JSON.stringify({ error: "Internal Server Error" }), {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      });
+      // 记录详细错误信息
+      console.error("PDF generation error:", error);
+
+      // 提取错误信息
+      const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+      const errorStack = error instanceof Error ? error.stack : undefined;
+
+      const response = new Response(
+        JSON.stringify({
+          error: "Internal Server Error",
+          message: "Failed to generate PDF",
+          details: errorMessage,
+          ...(errorStack && { stack: errorStack.split("\n").slice(0, 5).join("\n") }), // 只返回前5行堆栈
+        }),
+        {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
       return addCorsHeaders(response, allowedOrigin);
+    } finally {
+      // 确保 browser 正确关闭，避免资源泄漏
+      if (browser) {
+        await browser.close();
+      }
     }
   },
 } satisfies ExportedHandler<Env>;
